@@ -1,4 +1,4 @@
-ZMK Layer Overlay
+# ZMK Layer Overlay
 ZMK Layer Overlay は、自作キーボード（特に Charybdis や分割キーボード）のレイヤー操作を視覚的にサポートするツールです。
 特定のキー（レイヤー切り替えキー）を押している間、PC画面上に現在のレイヤーのキーマップ画像をオーバーレイ表示します。
 
