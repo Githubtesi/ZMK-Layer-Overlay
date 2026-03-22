@@ -3,6 +3,7 @@ import sys
 import tkinter as tk
 from tkinter import simpledialog
 import threading
+import time  # 追加
 from pynput import keyboard
 from PIL import Image, ImageTk, ImageDraw
 import pygetwindow as gw
@@ -23,9 +24,8 @@ TRANS_COLOR = "#abcdef"
 class LayerOverlay:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.withdraw()  # メインウィンドウは隠しておく
+        self.root.withdraw()
 
-        # オーバーレイ用のウィンドウ
         self.overlay = tk.Toplevel(self.root)
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
@@ -37,20 +37,16 @@ class LayerOverlay:
         self.overlay.withdraw()
 
         self.current_key = None
+        self.press_start_time = 0  # 押し下げ開始時刻
         self.after_id = None
 
-        # 設定値
-        self.duration_ms = 800  # デフォルト4秒
-        self.is_enabled = True  # 動作フラグ
+        self.duration_ms = 800
+        self.is_enabled = True
 
-        # システムトレイの初期化
         self.setup_tray()
 
     def setup_tray(self):
-        """システムトレイアイコンの作成"""
-        # アイコン画像がない場合のための簡易画像生成1
         icon_img = self.create_menu_icon()
-
         menu = (
             item('有効/無効', self.toggle_enabled, checked=lambda item: self.is_enabled),
             item('表示秒数の設定', self.set_duration),
@@ -59,7 +55,6 @@ class LayerOverlay:
         self.icon = pystray.Icon("LayerOverlay", icon_img, "Layer Overlay Tool", menu)
 
     def create_menu_icon(self):
-        """トレイ用のアイコン画像を生成（正方形に円）"""
         img = Image.new('RGB', (64, 64), color=(255, 255, 255))
         d = ImageDraw.Draw(img)
         d.ellipse((10, 10, 54, 54), fill=(0, 120, 215))
@@ -68,14 +63,11 @@ class LayerOverlay:
     def toggle_enabled(self, icon, item):
         self.is_enabled = not self.is_enabled
         if not self.is_enabled:
-            self.overlay.withdraw()
+            self.root.after(0, self.hide_layer, "forced")
 
     def set_duration(self, icon, item):
-        """秒数設定ダイアログを表示"""
-
-        # Tkinterのダイアログはメインスレッドで呼ぶ必要がある
         def ask():
-            new_sec = simpledialog.askfloat("設定", "表示する秒数を入力してください:",
+            new_sec = simpledialog.askfloat("設定", "1秒未満の時に表示する秒数を入力してください:",
                                             initialvalue=self.duration_ms / 1000, minvalue=0.1, maxvalue=60.0)
             if new_sec is not None:
                 self.duration_ms = int(new_sec * 1000)
@@ -103,8 +95,10 @@ class LayerOverlay:
         if not self.is_enabled:
             return
 
+        # 既存の消去タイマーがあればキャンセル（連続入力対応）
         if self.after_id:
             self.root.after_cancel(self.after_id)
+            self.after_id = None
 
         img_path = os.path.join(IMAGE_FOLDER, f"{key_name.lower()}.png")
         if not os.path.exists(img_path):
@@ -126,19 +120,25 @@ class LayerOverlay:
             self.overlay.geometry(f"{img.width}x{img.height}+{x}+{y}")
             self.overlay.deiconify()
 
-            # 設定された秒数で隠す
-            self.after_id = self.root.after(self.duration_ms, self.hide_layer)
+            # ここでは自動消去タイマーは起動しない（離した時に判定するため）
 
         except Exception as e:
             print(f"Error: {e}")
 
-    def hide_layer(self):
-        self.overlay.withdraw()
-        self.after_id = None
-        self.current_key = None
+    def start_hide_timer(self):
+        """1秒未満だった場合に、指定時間後に隠すタイマーを開始"""
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+
+        current_id = self.root.after(self.duration_ms, lambda: self.hide_layer(current_id))
+        self.after_id = current_id
+
+    def hide_layer(self, called_id):
+        if called_id == "forced" or called_id == self.after_id:
+            self.overlay.withdraw()
+            self.after_id = None
 
     def run(self):
-        # トレイアイコンを別スレッドで開始
         threading.Thread(target=self.icon.run, daemon=True).start()
         self.root.mainloop()
 
@@ -152,20 +152,37 @@ def on_press(key):
             return
 
         k = key.name if hasattr(key, 'name') else getattr(key, 'char', None)
+
         if k and overlay_app.current_key != k:
             overlay_app.current_key = k
+            overlay_app.press_start_time = time.time()  # 押し下げ時間を記録
             overlay_app.root.after(0, overlay_app.show_layer, k)
-    except:
+    except Exception:
         pass
 
 
 def on_release(key):
-    k = key.name if hasattr(key, 'name') else getattr(key, 'char', None)
-    if k == overlay_app.current_key:
-        overlay_app.current_key = None
+    try:
+        k = key.name if hasattr(key, 'name') else getattr(key, 'char', None)
+        if k == overlay_app.current_key:
+            # 経過時間を計算
+            elapsed = time.time() - overlay_app.press_start_time
+            overlay_app.current_key = None
+
+            if elapsed >= 2.0:
+                # 2秒以上の場合は即時非表示
+                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
+            elif elapsed < 1.0:
+                # 1秒未満の場合はタイマー開始
+                overlay_app.root.after(0, overlay_app.start_hide_timer)
+            else:
+                # 1秒〜2秒の間の場合の挙動（明記されていませんが、一般的には即時非表示が自然です）
+                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
+    except Exception:
+        pass
+
 
 if __name__ == '__main__':
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
-
     overlay_app.run()
