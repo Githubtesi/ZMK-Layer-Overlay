@@ -6,7 +6,7 @@ from tkinter import simpledialog
 import threading
 import time
 from pynput import keyboard
-from pynput.keyboard import Controller, KeyCode
+from pynput.keyboard import Controller, KeyCode, Key  # Keyを追加
 from PIL import Image, ImageTk, ImageDraw
 import pygetwindow as gw
 from screeninfo import get_monitors
@@ -15,26 +15,23 @@ from pystray import MenuItem as item
 
 # --- 設定項目 ---
 SHIFT_THRESHOLD = 0.4
-VK_IME_ON  = 0x16  # 強制IME ON
-VK_IME_OFF = 0x15  # 強制IME OFF
-# --- Windows IME制御用の設定 ---
-# 0 = オフ（直接入力）, 1 = オン（ひらがな）
+F13_HOLD_THRESHOLD = 0.2  # 0.2秒以上でShiftに切り替わり
+VK_IME_ON = 0x16
+VK_IME_OFF = 0x15
+
+# キーボードコントローラーの初期化
+kb_controller = Controller()
+
+
 def set_ime_status(mode):
-    """Windows APIを使用してIMEの状態を直接書き換える"""
     try:
-        # アクティブなウィンドウのハンドルを取得
         hwnd = ctypes.windll.user32.GetForegroundWindow()
-        # IME入力コンテキストを取得
         ime_hwnd = ctypes.windll.imm32.ImmGetDefaultIMEWnd(hwnd)
-        # WM_IME_CONTROL (0x0283) を送信して状態を変更
-        # IMC_SETOPENSTATUS (0x0006) を使用
         ctypes.windll.user32.SendMessageA(ime_hwnd, 0x0283, 0x0006, mode)
     except Exception as e:
         print(f"IME Control Error: {e}")
 
-SHIFT_THRESHOLD = 0.4  # F13の後の有効時間
 
-# パス設定
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
@@ -42,6 +39,7 @@ else:
 
 IMAGE_FOLDER = os.path.join(BASE_DIR, "layers")
 TRANS_COLOR = "#abcdef"
+
 
 class LayerOverlay:
     def __init__(self):
@@ -55,12 +53,19 @@ class LayerOverlay:
         self.label = tk.Label(self.overlay, bg=TRANS_COLOR)
         self.label.pack()
         self.overlay.withdraw()
+
+        # 状態管理変数
         self.current_key = None
         self.press_start_time = 0
         self.last_f13_time = 0
         self.after_id = None
         self.duration_ms = 800
         self.is_enabled = True
+
+        # --- F13 Hold-Tap 用 ---
+        self.f13_is_pressed = False
+        self.f13_as_shift_active = False
+
         self.setup_tray()
 
     def setup_tray(self):
@@ -85,10 +90,11 @@ class LayerOverlay:
 
     def set_duration(self, icon, item):
         def ask():
-            new_sec = simpledialog.askfloat("設定", "1秒未満の時に表示する秒数を入力してください:",
+            new_sec = simpledialog.askfloat("設定", "表示秒数を入力:",
                                             initialvalue=self.duration_ms / 1000, minvalue=0.1, maxvalue=60.0)
             if new_sec is not None:
                 self.duration_ms = int(new_sec * 1000)
+
         self.root.after(0, ask)
 
     def quit_app(self, icon, item):
@@ -129,7 +135,7 @@ class LayerOverlay:
             self.overlay.geometry(f"{img.width}x{img.height}+{x}+{y}")
             self.overlay.deiconify()
         except Exception as e:
-            print(f"Error showing image: {e}")
+            print(f"Error: {e}")
 
     def start_hide_timer(self):
         if self.after_id:
@@ -146,73 +152,122 @@ class LayerOverlay:
         threading.Thread(target=self.icon.run, daemon=True).start()
         self.root.mainloop()
 
+
 overlay_app = LayerOverlay()
-kb_controller = Controller()
 
-def set_ime_mode(mode):
-    """IMEを強制的に切り替える関数"""
-    code = VK_IME_ON if mode == "ZEN" else VK_IME_OFF
-    kb_controller.press(KeyCode.from_vk(code))
-    kb_controller.release(KeyCode.from_vk(code))
 
-def send_ime_state(state):
-    """IMEの状態を強制的に書き換える"""
-    code = VK_IME_ON if state == "ZEN" else VK_IME_OFF
-    kb_controller.press(KeyCode.from_vk(code))
-    kb_controller.release(KeyCode.from_vk(code))
+def check_f13_hold(start_time):
+    """別スレッドでF13の長押しを監視する"""
+    time.sleep(F13_HOLD_THRESHOLD)
+    # 指定時間経過後、まだ押されていればShiftをONにする
+    if overlay_app.f13_is_pressed and overlay_app.press_start_time == start_time:
+        overlay_app.f13_as_shift_active = True
+        kb_controller.press(Key.shift)
+        print("[System] F13 Hold: Shift ON")
 
 
 def on_press(key):
     try:
-        # キー名の取得
-        k = key.name if hasattr(key, 'name') else getattr(key, 'char', str(key))
+        if hasattr(key, 'name'):
+            k = key.name
+        elif hasattr(key, 'char') and key.char:
+            k = key.char
+        else:
+            k = str(key).strip("'")
+
         now = time.time()
 
-        # --- ご要望のロジック ---
+        # F13〜F24かどうかの判定
+        is_target_f_key = False
+        if k and k.lower().startswith('f'):
+            try:
+                f_num = int(k.lower().replace('f', ''))
+                if 13 <= f_num <= 24:
+                    is_target_f_key = True
+            except ValueError:
+                pass
 
-        # 1. F15 ➔ 強制的に半角英数 (IME OFF)
-        if k == 'f15':
-            print("[IME] F15: 強制OFF")
+        # --- 非表示判定 ---
+        if not is_target_f_key and k not in ['shift', 'shift_l', 'shift_r']:
+            if overlay_app.overlay.winfo_viewable():
+                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
+
+        # --- F13 特殊処理 (Hold-Tap) ---
+        if k == 'f13':
+            if not overlay_app.f13_is_pressed:
+                overlay_app.f13_is_pressed = True
+                overlay_app.press_start_time = now
+                # 長押し判定スレッド開始
+                threading.Thread(target=check_f13_hold, args=(now,), daemon=True).start()
+
+        # F15 IME OFF
+        elif k == 'f15':
             set_ime_status(0)
 
-        # 2. F13 ➔ 強制的に半角英数 (IME OFF) + 時刻記録
-        elif k == 'f13':
-            print("[IME] F13: 強制OFF + Shift待機")
-            overlay_app.last_f13_time = now
-            set_ime_status(0)
-
-        # 3. F13直後のShift ➔ 強制的にひらがな入力 (IME ON)
-        elif key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
+        # シフトキー単体（F13由来でない通常シフト）
+        elif k in ['shift', 'shift_l', 'shift_r']:
             if now - overlay_app.last_f13_time < SHIFT_THRESHOLD:
-                print("[IME] F13+Shift: 強制ONに上書き")
                 set_ime_status(1)
-                overlay_app.last_f13_time = 0  # リセット
+                overlay_app.last_f13_time = 0
 
-        # 画像オーバーレイ（既存の処理）
-        if k and overlay_app.current_key != k:
+        # 画像表示
+        if is_target_f_key and overlay_app.current_key != k:
             overlay_app.current_key = k
-            overlay_app.press_start_time = now
+            if k != 'f13':  # F13は既に記録済み
+                overlay_app.press_start_time = now
             overlay_app.root.after(0, overlay_app.show_layer, k)
 
     except Exception as e:
-        print(f"Error: {e}")
-        
+        print(f"Error in on_press: {e}")
+
+
 def on_release(key):
     try:
-        k = key.name if hasattr(key, 'name') else getattr(key, 'char', None)
-        if k == overlay_app.current_key:
-            elapsed = time.time() - overlay_app.press_start_time
+        if hasattr(key, 'name'):
+            k = key.name
+        elif hasattr(key, 'char') and key.char:
+            k = key.char
+        else:
+            k = str(key).strip("'")
+
+        now = time.time()
+
+        if k == 'f13':
+            duration = now - overlay_app.press_start_time
+            overlay_app.f13_is_pressed = False
+
+            # Shiftとして動作中だった場合は解除
+            if overlay_app.f13_as_shift_active:
+                kb_controller.release(Key.shift)
+                overlay_app.f13_as_shift_active = False
+                print("[System] F13 Release: Shift OFF")
+
+            # 短いタップだった場合のみ、IMEをOFFにし、F13+Shift判定用の時間を記録
+            elif duration < F13_HOLD_THRESHOLD:
+                set_ime_status(0)
+                overlay_app.last_f13_time = now
+                print("[System] F13 Tap: IME OFF")
+
+            # 画像の非表示処理
+            if duration >= 1.0:
+                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
+            else:
+                overlay_app.root.after(0, overlay_app.start_hide_timer)
+            overlay_app.current_key = None
+
+        elif k == overlay_app.current_key:
+            elapsed = now - overlay_app.press_start_time
             overlay_app.current_key = None
             if elapsed >= 1.0:
                 overlay_app.root.after(0, overlay_app.hide_layer, "forced")
             else:
                 overlay_app.root.after(0, overlay_app.start_hide_timer)
-    except Exception:
-        pass
+
+    except Exception as e:
+        print(f"Error in on_release: {e}")
+
 
 if __name__ == '__main__':
-    print("=== デバッグモード起動中 ===")
-    print("キーを叩くとここに名前が表示されます。F13やF15を押してみてください。")
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
     overlay_app.run()
