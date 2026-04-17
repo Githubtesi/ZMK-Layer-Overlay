@@ -177,7 +177,7 @@ def on_press(key):
 
         now = time.time()
 
-        # F13〜F24かどうかの判定
+        # F13〜F24判定
         is_target_f_key = False
         if k and k.lower().startswith('f'):
             try:
@@ -187,33 +187,24 @@ def on_press(key):
             except ValueError:
                 pass
 
-        # --- 非表示判定 ---
-        if not is_target_f_key and k not in ['shift', 'shift_l', 'shift_r']:
-            if overlay_app.overlay.winfo_viewable():
-                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
-
-        # --- F13 特殊処理 (Hold-Tap) ---
+        # --- F13をShiftとして動作させる (即時) ---
         if k == 'f13':
             if not overlay_app.f13_is_pressed:
                 overlay_app.f13_is_pressed = True
+                kb_controller.press(Key.shift)  # 即座にShiftをON
+                print("[System] F13 Hold: Shift ON (Immediate)")
+                # 画像表示のための時間記録
                 overlay_app.press_start_time = now
-                # 長押し判定スレッド開始
-                threading.Thread(target=check_f13_hold, args=(now,), daemon=True).start()
 
-        # F15 IME OFF
-        elif k == 'f15':
-            set_ime_status(0)
+        # --- その他のキーが押されたらオーバーレイを消す ---
+        if not is_target_f_key:
+            if overlay_app.overlay.winfo_viewable():
+                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
 
-        # シフトキー単体（F13由来でない通常シフト）
-        elif k in ['shift', 'shift_l', 'shift_r']:
-            if now - overlay_app.last_f13_time < SHIFT_THRESHOLD:
-                set_ime_status(1)
-                overlay_app.last_f13_time = 0
-
-        # 画像表示
+        # 画像表示ロジック
         if is_target_f_key and overlay_app.current_key != k:
             overlay_app.current_key = k
-            if k != 'f13':  # F13は既に記録済み
+            if k != 'f13':
                 overlay_app.press_start_time = now
             overlay_app.root.after(0, overlay_app.show_layer, k)
 
@@ -233,22 +224,12 @@ def on_release(key):
         now = time.time()
 
         if k == 'f13':
-            duration = now - overlay_app.press_start_time
             overlay_app.f13_is_pressed = False
-
-            # Shiftとして動作中だった場合は解除
-            if overlay_app.f13_as_shift_active:
-                kb_controller.release(Key.shift)
-                overlay_app.f13_as_shift_active = False
-                print("[System] F13 Release: Shift OFF")
-
-            # 短いタップだった場合のみ、IMEをOFFにし、F13+Shift判定用の時間を記録
-            elif duration < F13_HOLD_THRESHOLD:
-                set_ime_status(0)
-                overlay_app.last_f13_time = now
-                print("[System] F13 Tap: IME OFF")
+            kb_controller.release(Key.shift)  # F13を離したらShiftをOFF
+            print("[System] F13 Release: Shift OFF")
 
             # 画像の非表示処理
+            duration = now - overlay_app.press_start_time
             if duration >= 1.0:
                 overlay_app.root.after(0, overlay_app.hide_layer, "forced")
             else:
@@ -265,9 +246,10 @@ def on_release(key):
 
     except Exception as e:
         print(f"Error in on_release: {e}")
-
+        
 
 if __name__ == '__main__':
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
     overlay_app.run()
+
