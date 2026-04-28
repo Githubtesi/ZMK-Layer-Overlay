@@ -205,7 +205,7 @@ def on_release(key):
         else:
             k = str(key).strip("'")
 
-        if k == overlay_app.current_key
+        if k == overlay_app.current_key:
             overlay_app.current_key = None
             # リリース時にタイマーを開始（すでにshow_layerで開始しているが念のため）
             ui_queue.put(lambda: overlay_app.start_hide_timer())
