@@ -22,6 +22,26 @@ VK_IME_OFF = 0x15
 # キーボードコントローラーの初期化
 kb_controller = Controller()
 
+import queue
+import threading
+
+# --- キューを追加（全スレッド間通信用）---
+ui_queue = queue.Queue()
+
+def process_queue():
+    """mainloopから定期的にキューを処理"""
+    try:
+        while True:
+            func = ui_queue.get_nowait()
+            func()
+    except queue.Empty:
+        pass
+    overlay_app.root.after(50, process_queue)  # 50msごとにチェック
+
+    # LayerOverlay __init__の最後に追加
+    self.ui_queue = ui_queue
+    # run()内で
+    self.root.after(50, process_queue)
 
 def set_ime_status(mode):
     try:
@@ -207,6 +227,32 @@ def on_press(key):
             if k != 'f13':
                 overlay_app.press_start_time = now
             overlay_app.root.after(0, overlay_app.show_layer, k)
+
+        def safe_ui_action():
+
+            if is_target_f_key and overlay_app.current_key != k:
+                overlay_app.current_key = k
+
+                overlay_app.show_layer(k)
+
+        if not is_target_f_key and overlay_app.overlay.winfo_viewable():
+
+            ui_queue.put(lambda: overlay_app.hide_layer("forced"))
+
+        else:
+
+            ui_queue.put(safe_ui_action)
+
+        # F13処理（即時Shiftは一旦外して安全に）
+
+        if k == 'f13':
+
+            if not overlay_app.f13_is_pressed:
+                overlay_app.f13_is_pressed = True
+
+                # 即時Shiftは危険 → 代わりにフラグだけ立てて別スレッドで処理を検討
+
+                print("[System] F13 pressed")
 
     except Exception as e:
         print(f"Error in on_press: {e}")
