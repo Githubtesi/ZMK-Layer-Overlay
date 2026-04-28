@@ -5,8 +5,9 @@ import tkinter as tk
 from tkinter import simpledialog
 import threading
 import time
+import queue
+
 from pynput import keyboard
-from pynput.keyboard import Controller, KeyCode, Key  # Keyを追加
 from PIL import Image, ImageTk, ImageDraw
 import pygetwindow as gw
 from screeninfo import get_monitors
@@ -14,30 +15,20 @@ import pystray
 from pystray import MenuItem as item
 
 # --- 設定項目 ---
-SHIFT_THRESHOLD = 0.4
-F13_HOLD_THRESHOLD = 0.2  # 0.2秒以上でShiftに切り替わり
-VK_IME_ON = 0x16
-VK_IME_OFF = 0x15
+DURATION_MS = 800          # オーバーレイ表示時間（ms）
 
-# キーボードコントローラーの初期化
-kb_controller = Controller()
-
-import queue
-import threading
-
-# --- キューを追加（全スレッド間通信用）---
+# キュー（スレッド間安全通信用）
 ui_queue = queue.Queue()
 
 def process_queue():
-    """mainloopから定期的にキューを処理"""
+    """Tkinter mainloopから定期的にUI更新を処理"""
     try:
         while True:
             func = ui_queue.get_nowait()
             func()
     except queue.Empty:
         pass
-    overlay_app.root.after(50, process_queue)  # 50msごとにチェック
-
+    overlay_app.root.after(50, process_queue)
 
 
 def set_ime_status(mode):
@@ -71,23 +62,17 @@ class LayerOverlay:
         self.label.pack()
         self.overlay.withdraw()
 
-        # 状態管理変数
+        # 状態管理
         self.current_key = None
         self.press_start_time = 0
-        self.last_f13_time = 0
         self.after_id = None
-        self.duration_ms = 800
+        self.duration_ms = DURATION_MS
         self.is_enabled = True
 
-        # --- F13 Hold-Tap 用 ---
-        self.f13_is_pressed = False
-        self.f13_as_shift_active = False
-
         self.setup_tray()
-        # LayerOverlay __init__の最後に追加
         self.ui_queue = ui_queue
-        # run()内で
         self.root.after(50, process_queue)
+
     def setup_tray(self):
         icon_img = self.create_menu_icon()
         menu = (
@@ -106,15 +91,15 @@ class LayerOverlay:
     def toggle_enabled(self, icon, item):
         self.is_enabled = not self.is_enabled
         if not self.is_enabled:
-            self.root.after(0, self.hide_layer, "forced")
+            ui_queue.put(lambda: self.hide_layer("forced"))
 
     def set_duration(self, icon, item):
         def ask():
             new_sec = simpledialog.askfloat("設定", "表示秒数を入力:",
-                                            initialvalue=self.duration_ms / 1000, minvalue=0.1, maxvalue=60.0)
+                                            initialvalue=self.duration_ms / 1000,
+                                            minvalue=0.1, maxvalue=60.0)
             if new_sec is not None:
                 self.duration_ms = int(new_sec * 1000)
-
         self.root.after(0, ask)
 
     def quit_app(self, icon, item):
@@ -140,9 +125,11 @@ class LayerOverlay:
         if self.after_id:
             self.root.after_cancel(self.after_id)
             self.after_id = None
+
         img_path = os.path.join(IMAGE_FOLDER, f"{key_name.lower()}.png")
         if not os.path.exists(img_path):
             return
+
         monitor = self.get_active_monitor()
         try:
             img = Image.open(img_path).convert("RGBA")
@@ -154,8 +141,9 @@ class LayerOverlay:
             y = monitor.y + (monitor.height - img.height) // 2
             self.overlay.geometry(f"{img.width}x{img.height}+{x}+{y}")
             self.overlay.deiconify()
+            self.start_hide_timer()
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Show Layer Error: {e}")
 
     def start_hide_timer(self):
         if self.after_id:
@@ -173,17 +161,8 @@ class LayerOverlay:
         self.root.mainloop()
 
 
+# グローバルインスタンス
 overlay_app = LayerOverlay()
-
-
-def check_f13_hold(start_time):
-    """別スレッドでF13の長押しを監視する"""
-    time.sleep(F13_HOLD_THRESHOLD)
-    # 指定時間経過後、まだ押されていればShiftをONにする
-    if overlay_app.f13_is_pressed and overlay_app.press_start_time == start_time:
-        overlay_app.f13_as_shift_active = True
-        kb_controller.press(Key.shift)
-        print("[System] F13 Hold: Shift ON")
 
 
 def on_press(key):
@@ -197,62 +176,21 @@ def on_press(key):
 
         now = time.time()
 
-        # F13〜F24判定
-        is_target_f_key = False
-        if k and k.lower().startswith('f'):
-            try:
-                f_num = int(k.lower().replace('f', ''))
-                if 13 <= f_num <= 24:
-                    is_target_f_key = True
-            except ValueError:
-                pass
+        # F13〜F24 判定
+        is_target_f_key = k and k.lower().startswith('f') and \
+                         k.lower()[1:].isdigit() and 13 <= int(k.lower()[1:]) <= 24
 
-        # --- F13をShiftとして動作させる (即時) ---
-        if k == 'f13':
-            if not overlay_app.f13_is_pressed:
-                overlay_app.f13_is_pressed = True
-                kb_controller.press(Key.shift)  # 即座にShiftをON
-                print("[System] F13 Hold: Shift ON (Immediate)")
-                # 画像表示のための時間記録
-                overlay_app.press_start_time = now
-
-        # --- その他のキーが押されたらオーバーレイを消す ---
+        # その他のキーが押されたらオーバーレイを消す
         if not is_target_f_key:
             if overlay_app.overlay.winfo_viewable():
-                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
+                ui_queue.put(lambda: overlay_app.hide_layer("forced"))
+            return
 
-        # 画像表示ロジック
-        if is_target_f_key and overlay_app.current_key != k:
+        # Fキー（F13〜F24）の処理
+        if overlay_app.current_key != k:
             overlay_app.current_key = k
-            if k != 'f13':
-                overlay_app.press_start_time = now
-            overlay_app.root.after(0, overlay_app.show_layer, k)
-
-        def safe_ui_action():
-
-            if is_target_f_key and overlay_app.current_key != k:
-                overlay_app.current_key = k
-
-                overlay_app.show_layer(k)
-
-        if not is_target_f_key and overlay_app.overlay.winfo_viewable():
-
-            ui_queue.put(lambda: overlay_app.hide_layer("forced"))
-
-        else:
-
-            ui_queue.put(safe_ui_action)
-
-        # F13処理（即時Shiftは一旦外して安全に）
-
-        if k == 'f13':
-
-            if not overlay_app.f13_is_pressed:
-                overlay_app.f13_is_pressed = True
-
-                # 即時Shiftは危険 → 代わりにフラグだけ立てて別スレッドで処理を検討
-
-                print("[System] F13 pressed")
+            overlay_app.press_start_time = now
+            ui_queue.put(lambda: overlay_app.show_layer(k))
 
     except Exception as e:
         print(f"Error in on_press: {e}")
@@ -267,35 +205,16 @@ def on_release(key):
         else:
             k = str(key).strip("'")
 
-        now = time.time()
-
-        if k == 'f13':
-            overlay_app.f13_is_pressed = False
-            kb_controller.release(Key.shift)  # F13を離したらShiftをOFF
-            print("[System] F13 Release: Shift OFF")
-
-            # 画像の非表示処理
-            duration = now - overlay_app.press_start_time
-            if duration >= 1.0:
-                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
-            else:
-                overlay_app.root.after(0, overlay_app.start_hide_timer)
+        if k == overlay_app.current_key
             overlay_app.current_key = None
-
-        elif k == overlay_app.current_key:
-            elapsed = now - overlay_app.press_start_time
-            overlay_app.current_key = None
-            if elapsed >= 1.0:
-                overlay_app.root.after(0, overlay_app.hide_layer, "forced")
-            else:
-                overlay_app.root.after(0, overlay_app.start_hide_timer)
+            # リリース時にタイマーを開始（すでにshow_layerで開始しているが念のため）
+            ui_queue.put(lambda: overlay_app.start_hide_timer())
 
     except Exception as e:
         print(f"Error in on_release: {e}")
-        
+
 
 if __name__ == '__main__':
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
     overlay_app.run()
-
