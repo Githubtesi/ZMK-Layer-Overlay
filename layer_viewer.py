@@ -38,10 +38,7 @@ def process_queue():
         pass
     overlay_app.root.after(50, process_queue)  # 50msごとにチェック
 
-    # LayerOverlay __init__の最後に追加
-    self.ui_queue = ui_queue
-    # run()内で
-    self.root.after(50, process_queue)
+
 
 def set_ime_status(mode):
     try:
@@ -87,7 +84,10 @@ class LayerOverlay:
         self.f13_as_shift_active = False
 
         self.setup_tray()
-
+        # LayerOverlay __init__の最後に追加
+        self.ui_queue = ui_queue
+        # run()内で
+        self.root.after(50, process_queue)
     def setup_tray(self):
         icon_img = self.create_menu_icon()
         menu = (
