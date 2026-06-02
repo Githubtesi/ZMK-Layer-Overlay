@@ -6,7 +6,7 @@ from tkinter import simpledialog
 import threading
 import time
 import queue
-
+from ctypes import wintypes
 from pynput import keyboard
 from PIL import Image, ImageTk, ImageDraw
 import pygetwindow as gw
@@ -14,11 +14,50 @@ from screeninfo import get_monitors
 import pystray
 from pystray import MenuItem as item
 
+# DWORD_PTR は ctypes.wintypes に無い環境があるため自前定義
+DWORD_PTR = ctypes.c_size_t
+PDWORD_PTR = ctypes.POINTER(DWORD_PTR)
+
 # --- 設定項目 ---
 DURATION_MS = 800          # オーバーレイ表示時間（ms）
 
 # キュー（スレッド間安全通信用）
 ui_queue = queue.Queue()
+
+SMTO_ABORTIFHUNG = 0x0002
+TIMEOUT_MS = 50
+
+
+IMC_GETOPENSTATUS = 0x0005
+
+ctypes.windll.user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+    wintypes.UINT,
+    wintypes.UINT,
+    PDWORD_PTR
+]
+ctypes.windll.user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+
+def send_ime_message_timeout(ime_hwnd, wparam, lparam=0):
+    result = DWORD_PTR(0)
+
+    ok = ctypes.windll.user32.SendMessageTimeoutW(
+        ime_hwnd,
+        WM_IME_CONTROL,
+        wparam,
+        lparam,
+        SMTO_ABORTIFHUNG,
+        TIMEOUT_MS,
+        ctypes.byref(result)
+    )
+
+    if ok == 0:
+        return None
+
+    return result.value
 
 def process_queue():
     """Tkinter mainloopから定期的にUI更新を処理"""
@@ -50,12 +89,97 @@ TRANS_COLOR = "#abcdef"
 
 
 MODE_NAMES = {
-    "f13": "BASE",
-    "f14": "MOUSE",
-    "f15": "NUM",
-    "f16": "FUNC",
-    "f19": "EDIT",
+    "f13": "Keyboard",
+    "f14": "Mouse",
+    "f15": "Num",
+    "f16": "App",
+    "f19": "Edit",
 }
+
+MODE_NAMES_JP = {
+    "f13": "キーボード",
+    "f14": "マウス",
+    "f15": "テンキー",
+    "f16": "アプリ選択",
+    "f19": "編集",
+}
+
+
+
+# --- IME 状態取得用 ---
+WM_IME_CONTROL = 0x0283
+IMC_GETCONVERSIONMODE = 0x0001
+
+IME_CMODE_NATIVE = 0x0001
+IME_CMODE_KATAKANA = 0x0002
+IME_CMODE_FULLSHAPE = 0x0008
+IME_CMODE_ROMAN = 0x0010
+
+ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
+ctypes.windll.imm32.ImmGetDefaultIMEWnd.argtypes = [wintypes.HWND]
+ctypes.windll.imm32.ImmGetDefaultIMEWnd.restype = wintypes.HWND
+ctypes.windll.user32.SendMessageW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM
+]
+ctypes.windll.user32.SendMessageW.restype = wintypes.LPARAM
+
+
+def get_ime_input_status():
+    """
+    戻り値:
+        "japanese"      -> 日本語入力
+        "half_romaji"   -> 半角英数
+        "full_romaji"   -> 全角英数
+        "off"           -> IME OFF
+        "unknown"       -> 取得失敗
+    """
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return "unknown"
+
+        ime_hwnd = ctypes.windll.imm32.ImmGetDefaultIMEWnd(hwnd)
+        if not ime_hwnd:
+            return "unknown"
+
+        open_status = send_ime_message_timeout(
+            ime_hwnd,
+            IMC_GETOPENSTATUS,
+            0
+        )
+
+        if open_status is None:
+            return "unknown"
+
+        if not open_status:
+            return "off"
+
+        conv_mode = send_ime_message_timeout(
+            ime_hwnd,
+            IMC_GETCONVERSIONMODE,
+            0
+        )
+
+        if conv_mode is None:
+            return "unknown"
+
+        is_native = bool(conv_mode & IME_CMODE_NATIVE)
+        is_fullshape = bool(conv_mode & IME_CMODE_FULLSHAPE)
+
+        if is_native:
+            return "japanese"
+
+        if is_fullshape:
+            return "full_romaji"
+
+        return "half_romaji"
+
+    except Exception as e:
+        print(f"IME Status Error: {e}")
+        return "unknown"
 
 class LayerOverlay:
     def __init__(self):
@@ -77,9 +201,14 @@ class LayerOverlay:
         self.duration_ms = DURATION_MS
         self.is_enabled = True
 
+        self.active_mode_key = "f13"  # 現在表示中のモード
+        self.last_ime_status = None  # 前回のIME状態
+        self.ime_watch_interval_ms = 200  # IME監視間隔
+
         self.setup_tray()
         self.ui_queue = ui_queue
         self.root.after(50, process_queue)
+        self.root.after(200, self.watch_ime_status)
 
         self.status_overlay = tk.Toplevel(self.root)
         self.status_overlay.overrideredirect(True)
@@ -183,23 +312,59 @@ class LayerOverlay:
     def place_status_overlay(self):
         monitor = self.get_active_monitor()
 
-        self.status_overlay.update_idletasks()
-        w = self.status_overlay.winfo_width()
-        h = self.status_overlay.winfo_height()
+        # ラベルの必要サイズを再計算
+        self.status_label.update_idletasks()
+
+        # 現在幅ではなく、必要幅を使う
+        w = self.status_label.winfo_reqwidth()
+        h = self.status_label.winfo_reqheight()
+
+        # 念のため少し余白を追加
+        w += 8
+        h += 4
 
         x = monitor.x + monitor.width - w - 20
         y = monitor.y + monitor.height - h - 60
 
         self.status_overlay.geometry(f"{w}x{h}+{x}+{y}")
+    def update_mode_status(self, key_name, ime_status=None):
+        key_lower = key_name.lower()
 
-    def update_mode_status(self, key_name):
-        mode = MODE_NAMES.get(key_name.lower(), key_name.upper())
-        if mode == "":
-            mode = key_name.upper()
+        if key_lower not in MODE_NAMES:
+            mode = "None"
+
+        elif ime_status == "japanese":
+            mode = MODE_NAMES_JP.get(key_lower, MODE_NAMES.get(key_lower, "None"))
+
+        elif ime_status in ("half_romaji", "off"):
+            mode = MODE_NAMES.get(key_lower, "None")
+
+        elif ime_status == "full_romaji":
+            # 全角英数を日本語側にしたいなら MODE_NAMES_JP に変更
+            mode = MODE_NAMES.get(key_lower, "None")
+
+        else:
+            mode = MODE_NAMES.get(key_lower, "None") + "?"
 
         self.status_label.config(text=mode)
         self.place_status_overlay()
+    def watch_ime_status(self):
+        """
+        全角/半角・日本語入力状態が変わったら、
+        現在の active_mode_key に対して右下表示を更新する。
+        """
+        try:
+            if self.is_enabled:
+                ime_status = get_ime_input_status()
 
+                if ime_status != self.last_ime_status:
+                    self.last_ime_status = ime_status
+                    self.update_mode_status(self.active_mode_key, ime_status)
+
+        except Exception as e:
+            print(f"IME Watch Error: {e}")
+
+        self.root.after(self.ime_watch_interval_ms, self.watch_ime_status)
 
     def run(self):
         threading.Thread(target=self.icon.run, daemon=True).start()
@@ -228,17 +393,21 @@ def on_press(key):
 
         # その他のキーが押されたらオーバーレイを消す
         if not is_target_f_key:
-            if overlay_app.overlay.winfo_viewable():
-                ui_queue.put(lambda: overlay_app.hide_layer("forced"))
+            ui_queue.put(lambda: overlay_app.hide_layer("forced"))
             return
 
         # Fキー（F13〜F24）の処理
         if overlay_app.current_key != k:
             overlay_app.current_key = k
             overlay_app.press_start_time = now
-            ui_queue.put(lambda k=k: (
+
+            ime_status = get_ime_input_status()
+            overlay_app.active_mode_key = k.lower()
+            overlay_app.last_ime_status = ime_status
+
+            ui_queue.put(lambda k=k, ime_status=ime_status: (
                 overlay_app.show_layer(k),
-                overlay_app.update_mode_status(k)
+                overlay_app.update_mode_status(k, ime_status)
             ))
 
     except Exception as e:
