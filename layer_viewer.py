@@ -49,6 +49,14 @@ IMAGE_FOLDER = os.path.join(BASE_DIR, "layers")
 TRANS_COLOR = "#abcdef"
 
 
+MODE_NAMES = {
+    "f13": "BASE",
+    "f14": "MOUSE",
+    "f15": "NUM",
+    "f16": "FUNC",
+    "f19": "EDIT",
+}
+
 class LayerOverlay:
     def __init__(self):
         self.root = tk.Tk()
@@ -72,6 +80,22 @@ class LayerOverlay:
         self.setup_tray()
         self.ui_queue = ui_queue
         self.root.after(50, process_queue)
+
+        self.status_overlay = tk.Toplevel(self.root)
+        self.status_overlay.overrideredirect(True)
+        self.status_overlay.attributes("-topmost", True)
+        self.status_overlay.attributes("-alpha", 0.75)
+
+        self.status_label = tk.Label(
+            self.status_overlay,
+            text="BASE",
+            font=("Meiryo", 11, "bold"),
+            bg="#222222",
+            fg="white",
+            padx=10,
+            pady=4
+        )
+        self.status_label.pack()
 
     def setup_tray(self):
         icon_img = self.create_menu_icon()
@@ -156,8 +180,30 @@ class LayerOverlay:
             self.overlay.withdraw()
             self.after_id = None
 
+    def place_status_overlay(self):
+        monitor = self.get_active_monitor()
+
+        self.status_overlay.update_idletasks()
+        w = self.status_overlay.winfo_width()
+        h = self.status_overlay.winfo_height()
+
+        x = monitor.x + monitor.width - w - 20
+        y = monitor.y + monitor.height - h - 60
+
+        self.status_overlay.geometry(f"{w}x{h}+{x}+{y}")
+
+    def update_mode_status(self, key_name):
+        mode = MODE_NAMES.get(key_name.lower(), key_name.upper())
+        if mode == "":
+            mode = key_name.upper()
+
+        self.status_label.config(text=mode)
+        self.place_status_overlay()
+
+
     def run(self):
         threading.Thread(target=self.icon.run, daemon=True).start()
+        self.place_status_overlay()
         self.root.mainloop()
 
 
@@ -190,7 +236,10 @@ def on_press(key):
         if overlay_app.current_key != k:
             overlay_app.current_key = k
             overlay_app.press_start_time = now
-            ui_queue.put(lambda: overlay_app.show_layer(k))
+            ui_queue.put(lambda k=k: (
+                overlay_app.show_layer(k),
+                overlay_app.update_mode_status(k)
+            ))
 
     except Exception as e:
         print(f"Error in on_press: {e}")
@@ -212,6 +261,9 @@ def on_release(key):
 
     except Exception as e:
         print(f"Error in on_release: {e}")
+
+
+
 
 
 if __name__ == '__main__':
