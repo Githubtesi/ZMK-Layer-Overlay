@@ -663,7 +663,7 @@ def on_press(key):
 
         if hasattr(key, 'name'):
             k = key.name
-        elif hasattr(key, 'char') and key.char
+        elif hasattr(key, 'char') and key.char():
             k = key.char
         else:
             k = str(key).strip("'")
