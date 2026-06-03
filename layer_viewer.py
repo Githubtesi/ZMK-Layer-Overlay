@@ -18,6 +18,7 @@ from pystray import MenuItem as item
 DWORD_PTR = ctypes.c_size_t
 PDWORD_PTR = ctypes.POINTER(DWORD_PTR)
 
+# --- v2: 追従安定化 + 黒い四角表示対策 ---
 # --- 設定項目 ---
 DURATION_MS = 800          # オーバーレイ表示時間（ms）
 
@@ -27,8 +28,27 @@ ui_queue = queue.Queue()
 SMTO_ABORTIFHUNG = 0x0002
 TIMEOUT_MS = 50
 
-
 IMC_GETOPENSTATUS = 0x0005
+
+# --- Windows window style ---
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_LAYERED = 0x00080000
+WS_EX_NOACTIVATE = 0x08000000
+
+# 64bit / 32bit 両対応
+if hasattr(ctypes.windll.user32, "GetWindowLongPtrW"):
+    GetWindowLongPtr = ctypes.windll.user32.GetWindowLongPtrW
+    SetWindowLongPtr = ctypes.windll.user32.SetWindowLongPtrW
+else:
+    GetWindowLongPtr = ctypes.windll.user32.GetWindowLongW
+    SetWindowLongPtr = ctypes.windll.user32.SetWindowLongW
+
+GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
+GetWindowLongPtr.restype = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, GetWindowLongPtr.restype]
+SetWindowLongPtr.restype = GetWindowLongPtr.restype
 
 ctypes.windll.user32.SendMessageTimeoutW.argtypes = [
     wintypes.HWND,
@@ -54,7 +74,6 @@ class GUITHREADINFO(ctypes.Structure):
         ("rcCaret", wintypes.RECT),
     ]
 
-
 ctypes.windll.user32.GetWindowThreadProcessId.argtypes = [
     wintypes.HWND,
     ctypes.POINTER(wintypes.DWORD)
@@ -66,6 +85,14 @@ ctypes.windll.user32.GetGUIThreadInfo.argtypes = [
     ctypes.POINTER(GUITHREADINFO)
 ]
 ctypes.windll.user32.GetGUIThreadInfo.restype = wintypes.BOOL
+
+
+def make_click_through_noactivate(toplevel):
+    """
+    v2: 黒い四角表示対策のため、Windows拡張スタイル変更は行わない。
+    WS_EX_LAYERED / WS_EX_TRANSPARENT は環境によって Tk の描画と衝突することがある。
+    """
+    return
 
 
 def get_focus_hwnd():
@@ -93,6 +120,7 @@ def get_focus_hwnd():
 
     return hwnd
 
+
 def send_ime_message_timeout(ime_hwnd, wparam, lparam=0):
     result = DWORD_PTR(0)
 
@@ -111,21 +139,31 @@ def send_ime_message_timeout(ime_hwnd, wparam, lparam=0):
 
     return result.value
 
+
 def process_queue():
     """Tkinter mainloopから定期的にUI更新を処理"""
     try:
         while True:
             func = ui_queue.get_nowait()
-            func()
+            try:
+                func()
+            except Exception as e:
+                print(f"UI Queue Error: {e}")
     except queue.Empty:
         pass
-    overlay_app.root.after(50, process_queue)
+
+    if overlay_app is not None and overlay_app.is_running:
+        overlay_app.root.after(50, process_queue)
 
 
 def set_ime_status(mode):
     try:
         hwnd = get_focus_hwnd()
+        if not hwnd:
+            return
         ime_hwnd = ctypes.windll.imm32.ImmGetDefaultIMEWnd(hwnd)
+        if not ime_hwnd:
+            return
         ctypes.windll.user32.SendMessageA(ime_hwnd, 0x0283, 0x0006, mode)
     except Exception as e:
         print(f"IME Control Error: {e}")
@@ -138,7 +176,6 @@ else:
 
 IMAGE_FOLDER = os.path.join(BASE_DIR, "layers")
 TRANS_COLOR = "#abcdef"
-
 
 MODE_NAMES = {
     "f13": "Keyboard",
@@ -155,8 +192,6 @@ MODE_NAMES_JP = {
     "f16": "アプリ選択",
     "f19": "編集",
 }
-
-
 
 # --- IME 状態取得用 ---
 WM_IME_CONTROL = 0x0283
@@ -233,10 +268,14 @@ def get_ime_input_status():
         print(f"IME Status Error: {e}")
         return "unknown"
 
+
 class LayerOverlay:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
+
+        self.is_running = True
+        self.listener = None
 
         # 写真レイヤー用オーバーレイ
         self.overlay = tk.Toplevel(self.root)
@@ -261,26 +300,32 @@ class LayerOverlay:
         # ステータス表示の位置モード
         # False = 右下固定
         # True  = マウス追従
-        self.is_mouse_follow_enabled = False
+        self.is_mouse_follow_enabled = True
 
-        # 監視間隔
-        self.mouse_follow_interval_ms = 30
-        self.ime_watch_interval_ms = 200
+        # 追従間隔。30msはTkのgeometry連打になりやすいので少し緩める
+        self.mouse_follow_interval_ms = 80
+        self.ime_watch_interval_ms = 250
 
         self.active_mode_key = "f13"
         self.last_ime_status = None
+
+        # 追従時の無駄なgeometry更新を避けるためのキャッシュ
+        self._status_size = None
+        self._last_status_geometry = None
+        self._last_monitor_fetch = 0
+        self._monitor_cache = None
 
         # ステータス表示用オーバーレイ
         self.status_overlay = tk.Toplevel(self.root)
         self.status_overlay.overrideredirect(True)
         self.status_overlay.attributes("-topmost", True)
         self.status_overlay.attributes("-alpha", 0.92)
-        self.status_overlay.config(bg="#F6D7E0")  # 外側に少し色を持たせる
+        self.status_overlay.config(bg="#F6D7E0")
 
         # 外枠フレーム
         self.status_frame = tk.Frame(
             self.status_overlay,
-            bg="#F6D7E0",  # 枠色
+            bg="#F6D7E0",
             bd=0,
             padx=2,
             pady=2
@@ -292,13 +337,17 @@ class LayerOverlay:
             self.status_frame,
             text="BASE",
             font=("Yu Gothic UI", 11, "bold"),
-            bg="#FFF8FB",  # 中の背景色
+            bg="#FFF8FB",
             fg="#333333",
             padx=14,
             pady=6,
             relief="flat"
         )
         self.status_label.pack()
+
+        self.recalc_status_size()
+        # 黒い四角表示対策: Tkinter標準の描画に任せる
+        # make_click_through_noactivate(self.status_overlay)
 
         # トレイメニュー
         self.setup_tray()
@@ -307,10 +356,10 @@ class LayerOverlay:
         # 定期処理は最後に1回だけ登録
         self.root.after(50, process_queue)
         self.root.after(200, self.watch_ime_status)
-        self.root.after(30, self.follow_mouse)
+        self.root.after(self.mouse_follow_interval_ms, self.follow_mouse)
 
         # 初期位置
-        self.place_status_overlay()
+        self.place_status_overlay(force=True)
 
     def setup_tray(self):
         icon_img = self.create_menu_icon()
@@ -322,7 +371,6 @@ class LayerOverlay:
         )
         self.icon = pystray.Icon("LayerOverlay", icon_img, "Layer Overlay Tool", menu)
 
-
     def create_menu_icon(self):
         img = Image.new('RGB', (64, 64), color=(255, 255, 255))
         d = ImageDraw.Draw(img)
@@ -330,31 +378,56 @@ class LayerOverlay:
         return img
 
     def toggle_enabled(self, icon, item):
-        self.is_enabled = not self.is_enabled
-
-        # 写真表示をOFFにしたときだけ、表示中の写真レイヤーを消す
-        if not self.is_enabled:
-            ui_queue.put(lambda: self.hide_layer("forced"))
+        def do_toggle():
+            self.is_enabled = not self.is_enabled
+            if not self.is_enabled:
+                self.hide_layer("forced")
+        ui_queue.put(do_toggle)
 
     def toggle_mouse_follow(self, icon, item):
-        self.is_mouse_follow_enabled = not self.is_mouse_follow_enabled
-
-        # 切り替え直後に位置を更新
-        ui_queue.put(lambda: self.place_status_overlay())
-
+        def do_toggle():
+            self.is_mouse_follow_enabled = not self.is_mouse_follow_enabled
+            self.place_status_overlay(force=True)
+        ui_queue.put(do_toggle)
 
     def set_duration(self, icon, item):
         def ask():
-            new_sec = simpledialog.askfloat("設定", "表示秒数を入力:",
-                                            initialvalue=self.duration_ms / 1000,
-                                            minvalue=0.1, maxvalue=60.0)
+            new_sec = simpledialog.askfloat(
+                "設定",
+                "表示秒数を入力:",
+                initialvalue=self.duration_ms / 1000,
+                minvalue=0.1,
+                maxvalue=60.0
+            )
             if new_sec is not None:
                 self.duration_ms = int(new_sec * 1000)
-        self.root.after(0, ask)
+        ui_queue.put(ask)
 
-    def quit_app(self, icon, item):
-        self.icon.stop()
-        self.root.after(0, self.root.destroy)
+    def quit_app(self, icon=None, item=None):
+        def do_quit():
+            self.is_running = False
+            try:
+                if self.listener:
+                    self.listener.stop()
+            except Exception as e:
+                print(f"Listener Stop Error: {e}")
+            try:
+                self.icon.stop()
+            except Exception as e:
+                print(f"Tray Stop Error: {e}")
+            try:
+                self.root.quit()
+                self.root.destroy()
+            except Exception as e:
+                print(f"Tk Quit Error: {e}")
+        ui_queue.put(do_quit)
+
+    def get_monitors_cached(self):
+        now = time.time()
+        if self._monitor_cache is None or now - self._last_monitor_fetch > 1.0:
+            self._monitor_cache = get_monitors()
+            self._last_monitor_fetch = now
+        return self._monitor_cache
 
     def get_active_monitor(self):
         try:
@@ -362,12 +435,19 @@ class LayerOverlay:
             if window:
                 mid_x = window.left + window.width / 2
                 mid_y = window.top + window.height / 2
-                for m in get_monitors():
+                for m in self.get_monitors_cached():
                     if m.x <= mid_x <= m.x + m.width and m.y <= mid_y <= m.y + m.height:
                         return m
-        except:
+        except Exception:
             pass
-        return get_monitors()[0]
+        monitors = self.get_monitors_cached()
+        return monitors[0]
+
+    def get_monitor_from_point(self, x, y):
+        for m in self.get_monitors_cached():
+            if m.x <= x <= m.x + m.width and m.y <= y <= m.y + m.height:
+                return m
+        return self.get_monitors_cached()[0]
 
     def show_layer(self, key_name):
         if not self.is_enabled:
@@ -406,11 +486,22 @@ class LayerOverlay:
             self.overlay.withdraw()
             self.after_id = None
 
-    def place_status_overlay(self):
-        self.status_label.update_idletasks()
+    def recalc_status_size(self):
+        """文字変更時だけサイズを再計算。追従中に毎回update_idletasksしない。"""
+        try:
+            self.status_label.update_idletasks()
+            w = self.status_label.winfo_reqwidth() + 8
+            h = self.status_label.winfo_reqheight() + 4
+            self._status_size = (w, h)
+        except Exception as e:
+            print(f"Status Size Error: {e}")
+            self._status_size = (120, 36)
 
-        w = self.status_label.winfo_reqwidth() + 8
-        h = self.status_label.winfo_reqheight() + 4
+    def place_status_overlay(self, force=False):
+        if self._status_size is None:
+            self.recalc_status_size()
+
+        w, h = self._status_size
 
         if self.is_mouse_follow_enabled:
             # マウス追従表示
@@ -423,14 +514,7 @@ class LayerOverlay:
             x = mouse_x + offset_x
             y = mouse_y + offset_y
 
-            target_monitor = None
-            for m in get_monitors():
-                if m.x <= mouse_x <= m.x + m.width and m.y <= mouse_y <= m.y + m.height:
-                    target_monitor = m
-                    break
-
-            if target_monitor is None:
-                target_monitor = get_monitors()[0]
+            target_monitor = self.get_monitor_from_point(mouse_x, mouse_y)
 
             # 右にはみ出す場合は左側へ
             if x + w > target_monitor.x + target_monitor.width:
@@ -443,18 +527,20 @@ class LayerOverlay:
             # 画面外に出ないよう補正
             if x < target_monitor.x:
                 x = target_monitor.x
-
             if y < target_monitor.y:
                 y = target_monitor.y
-
         else:
             # 右下固定表示
             monitor = self.get_active_monitor()
-
             x = monitor.x + monitor.width - w - 20
             y = monitor.y + monitor.height - h - 60
 
-        self.status_overlay.geometry(f"{w}x{h}+{x}+{y}")
+        geometry = f"{w}x{h}+{int(x)}+{int(y)}"
+
+        # 同じ位置ならgeometryを打たない。Tk/Windowsへの負荷を減らす。
+        if force or geometry != self._last_status_geometry:
+            self.status_overlay.geometry(geometry)
+            self._last_status_geometry = geometry
 
     def follow_mouse(self):
         """
@@ -462,12 +548,13 @@ class LayerOverlay:
         写真表示の有効/無効とは独立。
         """
         try:
-            if self.is_mouse_follow_enabled:
+            if self.is_running and self.is_mouse_follow_enabled:
                 self.place_status_overlay()
         except Exception as e:
             print(f"Mouse Follow Error: {e}")
 
-        self.root.after(self.mouse_follow_interval_ms, self.follow_mouse)
+        if self.is_running:
+            self.root.after(self.mouse_follow_interval_ms, self.follow_mouse)
 
     def update_mode_status(self, key_name, ime_status=None):
         key_lower = key_name.lower()
@@ -480,15 +567,15 @@ class LayerOverlay:
 
         elif ime_status == "japanese":
             mode = MODE_NAMES_JP.get(key_lower, MODE_NAMES.get(key_lower, "None"))
-            fg_color = "#D9385E"  # 赤より少し可愛いピンク寄り
-            bg_color = "#FFF0F5"  # 薄いピンク
-            border_color = "#F5B7C8"  # 枠もピンク
+            fg_color = "#D9385E"
+            bg_color = "#FFF0F5"
+            border_color = "#F5B7C8"
 
         elif ime_status in ("half_romaji", "full_romaji", "off"):
             mode = MODE_NAMES.get(key_lower, "None")
             fg_color = "#333333"
-            bg_color = "#F9FCFF"  # ほんのり白青
-            border_color = "#C9DCEC"  # やさしい枠色
+            bg_color = "#F9FCFF"
+            border_color = "#C9DCEC"
 
         else:
             mode = MODE_NAMES.get(key_lower, "None") + "?"
@@ -505,8 +592,10 @@ class LayerOverlay:
         self.status_frame.config(bg=border_color)
         self.status_overlay.config(bg=border_color)
 
-        self.place_status_overlay()
-        
+        # 文字が変わったときだけサイズ再計算
+        self.recalc_status_size()
+        self.place_status_overlay(force=True)
+
     def watch_ime_status(self):
         """
         IME状態は写真表示の有効/無効とは関係なく常に監視する。
@@ -521,21 +610,30 @@ class LayerOverlay:
         except Exception as e:
             print(f"IME Watch Error: {e}")
 
-        self.root.after(self.ime_watch_interval_ms, self.watch_ime_status)
-
+        if self.is_running:
+            self.root.after(self.ime_watch_interval_ms, self.watch_ime_status)
 
     def run(self):
-        threading.Thread(target=self.icon.run, daemon=True).start()
-        self.place_status_overlay()
+        # pystrayはTkinterなど他のイベントループと併用する場合、run_detachedが安全
+        try:
+            self.icon.run_detached()
+        except NotImplementedError:
+            # Windows以外などで未対応の場合だけフォールバック
+            threading.Thread(target=self.icon.run, daemon=True).start()
+
+        self.place_status_overlay(force=True)
         self.root.mainloop()
 
 
 # グローバルインスタンス
-overlay_app = LayerOverlay()
+overlay_app = None
 
 
 def on_press(key):
     try:
+        if overlay_app is None or not overlay_app.is_running:
+            return
+
         if hasattr(key, 'name'):
             k = key.name
         elif hasattr(key, 'char') and key.char:
@@ -574,6 +672,9 @@ def on_press(key):
 
 def on_release(key):
     try:
+        if overlay_app is None or not overlay_app.is_running:
+            return
+
         if hasattr(key, 'name'):
             k = key.name
         elif hasattr(key, 'char') and key.char:
@@ -590,10 +691,9 @@ def on_release(key):
         print(f"Error in on_release: {e}")
 
 
-
-
-
 if __name__ == '__main__':
+    overlay_app = LayerOverlay()
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    overlay_app.listener = listener
     listener.start()
     overlay_app.run()
