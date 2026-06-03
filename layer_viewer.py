@@ -237,11 +237,14 @@ class LayerOverlay:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
+
+        # 写真レイヤー用オーバーレイ
         self.overlay = tk.Toplevel(self.root)
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
         self.overlay.attributes("-transparentcolor", TRANS_COLOR)
         self.overlay.config(bg=TRANS_COLOR)
+
         self.label = tk.Label(self.overlay, bg=TRANS_COLOR)
         self.label.pack()
         self.overlay.withdraw()
@@ -251,17 +254,23 @@ class LayerOverlay:
         self.press_start_time = 0
         self.after_id = None
         self.duration_ms = DURATION_MS
+
+        # 写真レイヤー表示だけを制御する
         self.is_enabled = True
 
-        self.active_mode_key = "f13"  # 現在表示中のモード
-        self.last_ime_status = None  # 前回のIME状態
-        self.ime_watch_interval_ms = 200  # IME監視間隔
+        # ステータス表示の位置モード
+        # False = 右下固定
+        # True  = マウス追従
+        self.is_mouse_follow_enabled = False
 
-        self.setup_tray()
-        self.ui_queue = ui_queue
-        self.root.after(50, process_queue)
-        self.root.after(200, self.watch_ime_status)
+        # 監視間隔
+        self.mouse_follow_interval_ms = 30
+        self.ime_watch_interval_ms = 200
 
+        self.active_mode_key = "f13"
+        self.last_ime_status = None
+
+        # ステータス表示用オーバーレイ
         self.status_overlay = tk.Toplevel(self.root)
         self.status_overlay.overrideredirect(True)
         self.status_overlay.attributes("-topmost", True)
@@ -278,14 +287,28 @@ class LayerOverlay:
         )
         self.status_label.pack()
 
+        # トレイメニュー
+        self.setup_tray()
+        self.ui_queue = ui_queue
+
+        # 定期処理は最後に1回だけ登録
+        self.root.after(50, process_queue)
+        self.root.after(200, self.watch_ime_status)
+        self.root.after(30, self.follow_mouse)
+
+        # 初期位置
+        self.place_status_overlay()
+
     def setup_tray(self):
         icon_img = self.create_menu_icon()
         menu = (
-            item('有効/無効', self.toggle_enabled, checked=lambda item: self.is_enabled),
+            item('写真表示 有効/無効', self.toggle_enabled, checked=lambda item: self.is_enabled),
+            item('追従', self.toggle_mouse_follow, checked=lambda item: self.is_mouse_follow_enabled),
             item('表示秒数の設定', self.set_duration),
             item('終了', self.quit_app)
         )
         self.icon = pystray.Icon("LayerOverlay", icon_img, "Layer Overlay Tool", menu)
+
 
     def create_menu_icon(self):
         img = Image.new('RGB', (64, 64), color=(255, 255, 255))
@@ -295,8 +318,17 @@ class LayerOverlay:
 
     def toggle_enabled(self, icon, item):
         self.is_enabled = not self.is_enabled
+
+        # 写真表示をOFFにしたときだけ、表示中の写真レイヤーを消す
         if not self.is_enabled:
             ui_queue.put(lambda: self.hide_layer("forced"))
+
+    def toggle_mouse_follow(self, icon, item):
+        self.is_mouse_follow_enabled = not self.is_mouse_follow_enabled
+
+        # 切り替え直後に位置を更新
+        ui_queue.put(lambda: self.place_status_overlay())
+
 
     def set_duration(self, icon, item):
         def ask():
@@ -362,23 +394,67 @@ class LayerOverlay:
             self.after_id = None
 
     def place_status_overlay(self):
-        monitor = self.get_active_monitor()
-
-        # ラベルの必要サイズを再計算
         self.status_label.update_idletasks()
 
-        # 現在幅ではなく、必要幅を使う
-        w = self.status_label.winfo_reqwidth()
-        h = self.status_label.winfo_reqheight()
+        w = self.status_label.winfo_reqwidth() + 8
+        h = self.status_label.winfo_reqheight() + 4
 
-        # 念のため少し余白を追加
-        w += 8
-        h += 4
+        if self.is_mouse_follow_enabled:
+            # マウス追従表示
+            mouse_x = self.root.winfo_pointerx()
+            mouse_y = self.root.winfo_pointery()
 
-        x = monitor.x + monitor.width - w - 20
-        y = monitor.y + monitor.height - h - 60
+            offset_x = 18
+            offset_y = 24
+
+            x = mouse_x + offset_x
+            y = mouse_y + offset_y
+
+            target_monitor = None
+            for m in get_monitors():
+                if m.x <= mouse_x <= m.x + m.width and m.y <= mouse_y <= m.y + m.height:
+                    target_monitor = m
+                    break
+
+            if target_monitor is None:
+                target_monitor = get_monitors()[0]
+
+            # 右にはみ出す場合は左側へ
+            if x + w > target_monitor.x + target_monitor.width:
+                x = mouse_x - w - offset_x
+
+            # 下にはみ出す場合は上側へ
+            if y + h > target_monitor.y + target_monitor.height:
+                y = mouse_y - h - offset_y
+
+            # 画面外に出ないよう補正
+            if x < target_monitor.x:
+                x = target_monitor.x
+
+            if y < target_monitor.y:
+                y = target_monitor.y
+
+        else:
+            # 右下固定表示
+            monitor = self.get_active_monitor()
+
+            x = monitor.x + monitor.width - w - 20
+            y = monitor.y + monitor.height - h - 60
 
         self.status_overlay.geometry(f"{w}x{h}+{x}+{y}")
+
+    def follow_mouse(self):
+        """
+        追従ONのときだけ、ステータス表示をマウスに追従させる。
+        写真表示の有効/無効とは独立。
+        """
+        try:
+            if self.is_mouse_follow_enabled:
+                self.place_status_overlay()
+        except Exception as e:
+            print(f"Mouse Follow Error: {e}")
+
+        self.root.after(self.mouse_follow_interval_ms, self.follow_mouse)
 
     def update_mode_status(self, key_name, ime_status=None):
         key_lower = key_name.lower()
@@ -416,21 +492,20 @@ class LayerOverlay:
 
     def watch_ime_status(self):
         """
-        全角/半角・日本語入力状態が変わったら、
-        現在の active_mode_key に対して右下表示を更新する。
+        IME状態は写真表示の有効/無効とは関係なく常に監視する。
         """
         try:
-            if self.is_enabled:
-                ime_status = get_ime_input_status()
+            ime_status = get_ime_input_status()
 
-                if ime_status != self.last_ime_status:
-                    self.last_ime_status = ime_status
-                    self.update_mode_status(self.active_mode_key, ime_status)
+            if ime_status != self.last_ime_status:
+                self.last_ime_status = ime_status
+                self.update_mode_status(self.active_mode_key, ime_status)
 
         except Exception as e:
             print(f"IME Watch Error: {e}")
 
         self.root.after(self.ime_watch_interval_ms, self.watch_ime_status)
+
 
     def run(self):
         threading.Thread(target=self.icon.run, daemon=True).start()
