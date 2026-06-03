@@ -274,16 +274,29 @@ class LayerOverlay:
         self.status_overlay = tk.Toplevel(self.root)
         self.status_overlay.overrideredirect(True)
         self.status_overlay.attributes("-topmost", True)
-        self.status_overlay.attributes("-alpha", 0.75)
+        self.status_overlay.attributes("-alpha", 0.92)
+        self.status_overlay.config(bg="#F6D7E0")  # 外側に少し色を持たせる
 
-        self.status_label = tk.Label(
+        # 外枠フレーム
+        self.status_frame = tk.Frame(
             self.status_overlay,
+            bg="#F6D7E0",  # 枠色
+            bd=0,
+            padx=2,
+            pady=2
+        )
+        self.status_frame.pack()
+
+        # 中身ラベル
+        self.status_label = tk.Label(
+            self.status_frame,
             text="BASE",
-            font=("Meiryo", 11, "bold"),
-            bg="white",
-            fg="black",
-            padx=10,
-            pady=4
+            font=("Yu Gothic UI", 11, "bold"),
+            bg="#FFF8FB",  # 中の背景色
+            fg="#333333",
+            padx=14,
+            pady=6,
+            relief="flat"
         )
         self.status_label.pack()
 
@@ -459,27 +472,29 @@ class LayerOverlay:
     def update_mode_status(self, key_name, ime_status=None):
         key_lower = key_name.lower()
 
-        # デフォルト色
-        fg_color = "black"
-        bg_color = "white"
-
         if key_lower not in MODE_NAMES:
             mode = "None"
+            fg_color = "#333333"
+            bg_color = "#FFF8FB"
+            border_color = "#F6D7E0"
 
         elif ime_status == "japanese":
             mode = MODE_NAMES_JP.get(key_lower, MODE_NAMES.get(key_lower, "None"))
-            fg_color = "red"  # 日本語入力は赤字
-            bg_color = "white"
+            fg_color = "#D9385E"  # 赤より少し可愛いピンク寄り
+            bg_color = "#FFF0F5"  # 薄いピンク
+            border_color = "#F5B7C8"  # 枠もピンク
 
         elif ime_status in ("half_romaji", "full_romaji", "off"):
             mode = MODE_NAMES.get(key_lower, "None")
-            fg_color = "black"  # ローマ字・英数は黒字
-            bg_color = "white"
+            fg_color = "#333333"
+            bg_color = "#F9FCFF"  # ほんのり白青
+            border_color = "#C9DCEC"  # やさしい枠色
 
         else:
             mode = MODE_NAMES.get(key_lower, "None") + "?"
-            fg_color = "black"
-            bg_color = "white"
+            fg_color = "#333333"
+            bg_color = "#FFF8FB"
+            border_color = "#D9D9D9"
 
         self.status_label.config(
             text=mode,
@@ -487,9 +502,11 @@ class LayerOverlay:
             bg=bg_color
         )
 
-        self.status_overlay.config(bg=bg_color)
-        self.place_status_overlay()
+        self.status_frame.config(bg=border_color)
+        self.status_overlay.config(bg=border_color)
 
+        self.place_status_overlay()
+        
     def watch_ime_status(self):
         """
         IME状態は写真表示の有効/無効とは関係なく常に監視する。
