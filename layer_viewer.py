@@ -41,6 +41,58 @@ ctypes.windll.user32.SendMessageTimeoutW.argtypes = [
 ]
 ctypes.windll.user32.SendMessageTimeoutW.restype = wintypes.LPARAM
 
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
+ctypes.windll.user32.GetWindowThreadProcessId.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD)
+]
+ctypes.windll.user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+ctypes.windll.user32.GetGUIThreadInfo.argtypes = [
+    wintypes.DWORD,
+    ctypes.POINTER(GUITHREADINFO)
+]
+ctypes.windll.user32.GetGUIThreadInfo.restype = wintypes.BOOL
+
+
+def get_focus_hwnd():
+    """
+    前面ウィンドウではなく、実際にフォーカスを持っている子ウィンドウを取得する。
+    Outlook / WebView / Office系アプリ対策。
+    """
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+
+    pid = wintypes.DWORD()
+    thread_id = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+    gui_info = GUITHREADINFO()
+    gui_info.cbSize = ctypes.sizeof(GUITHREADINFO)
+
+    if ctypes.windll.user32.GetGUIThreadInfo(thread_id, ctypes.byref(gui_info)):
+        if gui_info.hwndFocus:
+            return gui_info.hwndFocus
+        if gui_info.hwndCaret:
+            return gui_info.hwndCaret
+        if gui_info.hwndActive:
+            return gui_info.hwndActive
+
+    return hwnd
+
 def send_ime_message_timeout(ime_hwnd, wparam, lparam=0):
     result = DWORD_PTR(0)
 
@@ -72,7 +124,7 @@ def process_queue():
 
 def set_ime_status(mode):
     try:
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        hwnd = get_focus_hwnd()
         ime_hwnd = ctypes.windll.imm32.ImmGetDefaultIMEWnd(hwnd)
         ctypes.windll.user32.SendMessageA(ime_hwnd, 0x0283, 0x0006, mode)
     except Exception as e:
@@ -137,7 +189,7 @@ def get_ime_input_status():
         "unknown"       -> 取得失敗
     """
     try:
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        hwnd = get_focus_hwnd()
         if not hwnd:
             return "unknown"
 
@@ -219,8 +271,8 @@ class LayerOverlay:
             self.status_overlay,
             text="BASE",
             font=("Meiryo", 11, "bold"),
-            bg="#222222",
-            fg="white",
+            bg="white",
+            fg="black",
             padx=10,
             pady=4
         )
@@ -327,27 +379,41 @@ class LayerOverlay:
         y = monitor.y + monitor.height - h - 60
 
         self.status_overlay.geometry(f"{w}x{h}+{x}+{y}")
+
     def update_mode_status(self, key_name, ime_status=None):
         key_lower = key_name.lower()
+
+        # デフォルト色
+        fg_color = "black"
+        bg_color = "white"
 
         if key_lower not in MODE_NAMES:
             mode = "None"
 
         elif ime_status == "japanese":
             mode = MODE_NAMES_JP.get(key_lower, MODE_NAMES.get(key_lower, "None"))
+            fg_color = "red"  # 日本語入力は赤字
+            bg_color = "white"
 
-        elif ime_status in ("half_romaji", "off"):
+        elif ime_status in ("half_romaji", "full_romaji", "off"):
             mode = MODE_NAMES.get(key_lower, "None")
-
-        elif ime_status == "full_romaji":
-            # 全角英数を日本語側にしたいなら MODE_NAMES_JP に変更
-            mode = MODE_NAMES.get(key_lower, "None")
+            fg_color = "black"  # ローマ字・英数は黒字
+            bg_color = "white"
 
         else:
             mode = MODE_NAMES.get(key_lower, "None") + "?"
+            fg_color = "black"
+            bg_color = "white"
 
-        self.status_label.config(text=mode)
+        self.status_label.config(
+            text=mode,
+            fg=fg_color,
+            bg=bg_color
+        )
+
+        self.status_overlay.config(bg=bg_color)
         self.place_status_overlay()
+
     def watch_ime_status(self):
         """
         全角/半角・日本語入力状態が変わったら、
