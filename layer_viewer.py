@@ -308,6 +308,7 @@ class LayerOverlay:
 
         self.active_mode_key = "f13"
         self.last_ime_status = None
+        self.last_valid_ime_status = "half_romaji"
 
         # 追従時の無駄なgeometry更新を避けるためのキャッシュ
         self._status_size = None
@@ -462,16 +463,17 @@ class LayerOverlay:
 
         monitor = self.get_active_monitor()
         try:
-            img = Image.open(img_path).convert("RGBA")
-            max_w, max_h = int(monitor.width * 0.8), int(monitor.height * 0.8)
-            img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
-            self.photo = ImageTk.PhotoImage(img)
-            self.label.config(image=self.photo)
-            x = monitor.x + (monitor.width - img.width) // 2
-            y = monitor.y + (monitor.height - img.height) // 2
-            self.overlay.geometry(f"{img.width}x{img.height}+{x}+{y}")
-            self.overlay.deiconify()
-            self.start_hide_timer()
+            with Image.open(img_path) as img:
+                img = img.convert("RGBA")
+                max_w, max_h = int(monitor.width * 0.8), int(monitor.height * 0.8)
+                img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+                self.photo = ImageTk.PhotoImage(img)
+                self.label.config(image=self.photo)
+                x = monitor.x + (monitor.width - img.width) // 2
+                y = monitor.y + (monitor.height - img.height) // 2
+                self.overlay.geometry(f"{img.width}x{img.height}+{x}+{y}")
+                self.overlay.deiconify()
+                self.start_hide_timer()
         except Exception as e:
             print(f"Show Layer Error: {e}")
 
@@ -556,6 +558,24 @@ class LayerOverlay:
         if self.is_running:
             self.root.after(self.mouse_follow_interval_ms, self.follow_mouse)
 
+    def handle_mode_key(self, key_name):
+        """
+        F13〜F24が押されたときの表示更新。
+        pynput側ではIME取得せず、Tkinter側で安全に処理する。
+        """
+        self.press_start_time = time.time()
+
+        ime_status = self.last_valid_ime_status
+
+        if ime_status not in ("japanese", "half_romaji", "full_romaji", "off"):
+            ime_status = "half_romaji"
+
+        self.active_mode_key = key_name.lower()
+        self.last_ime_status = ime_status
+
+        self.show_layer(key_name)
+        self.update_mode_status(key_name, ime_status)
+
     def update_mode_status(self, key_name, ime_status=None):
         key_lower = key_name.lower()
 
@@ -598,20 +618,27 @@ class LayerOverlay:
 
     def watch_ime_status(self):
         """
-        IME状態は写真表示の有効/無効とは関係なく常に監視する。
+        IME状態を監視する。
+        unknown は表示更新に使わない。
         """
         try:
             ime_status = get_ime_input_status()
 
-            if ime_status != self.last_ime_status:
-                self.last_ime_status = ime_status
-                self.update_mode_status(self.active_mode_key, ime_status)
+            if ime_status == "unknown":
+                pass
+            else:
+                self.last_valid_ime_status = ime_status
+
+                if ime_status != self.last_ime_status:
+                    self.last_ime_status = ime_status
+                    self.update_mode_status(self.active_mode_key, ime_status)
 
         except Exception as e:
             print(f"IME Watch Error: {e}")
 
         if self.is_running:
             self.root.after(self.ime_watch_interval_ms, self.watch_ime_status)
+
 
     def run(self):
         # pystrayはTkinterなど他のイベントループと併用する場合、run_detachedが安全
@@ -636,12 +663,12 @@ def on_press(key):
 
         if hasattr(key, 'name'):
             k = key.name
-        elif hasattr(key, 'char') and key.char:
+        elif hasattr(key, 'char') and key.char
             k = key.char
         else:
             k = str(key).strip("'")
 
-        now = time.time()
+
 
         # F13〜F24 判定
         is_target_f_key = k and k.lower().startswith('f') and \
@@ -649,22 +676,15 @@ def on_press(key):
 
         # その他のキーが押されたらオーバーレイを消す
         if not is_target_f_key:
-            ui_queue.put(lambda: overlay_app.hide_layer("forced"))
+            if overlay_app.after_id is not None:
+                ui_queue.put(lambda: overlay_app.hide_layer("forced"))
             return
 
         # Fキー（F13〜F24）の処理
+        # Fキー（F13〜F24）の処理
         if overlay_app.current_key != k:
             overlay_app.current_key = k
-            overlay_app.press_start_time = now
-
-            ime_status = get_ime_input_status()
-            overlay_app.active_mode_key = k.lower()
-            overlay_app.last_ime_status = ime_status
-
-            ui_queue.put(lambda k=k, ime_status=ime_status: (
-                overlay_app.show_layer(k),
-                overlay_app.update_mode_status(k, ime_status)
-            ))
+            ui_queue.put(lambda k=k: overlay_app.handle_mode_key(k))
 
     except Exception as e:
         print(f"Error in on_press: {e}")
