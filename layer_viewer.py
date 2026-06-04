@@ -178,7 +178,7 @@ IMAGE_FOLDER = os.path.join(BASE_DIR, "layers")
 TRANS_COLOR = "#abcdef"
 
 MODE_NAMES = {
-    "f13": "Keyboard",
+    "f13": "Key",
     "f14": "Mouse",
     "f15": "Num",
     "f16": "App",
@@ -186,11 +186,11 @@ MODE_NAMES = {
 }
 
 MODE_NAMES_JP = {
-    "f13": "キーボード",
-    "f14": "マウス",
+    "f13": "キー",
+    "f14": "Mouse",
     "f15": "テンキー",
-    "f16": "アプリ選択",
-    "f19": "編集",
+    "f16": "App",
+    "f19": "Edit",
 }
 
 # --- IME 状態取得用 ---
@@ -202,16 +202,22 @@ IME_CMODE_KATAKANA = 0x0002
 IME_CMODE_FULLSHAPE = 0x0008
 IME_CMODE_ROMAN = 0x0010
 
-ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
-ctypes.windll.imm32.ImmGetDefaultIMEWnd.argtypes = [wintypes.HWND]
-ctypes.windll.imm32.ImmGetDefaultIMEWnd.restype = wintypes.HWND
-ctypes.windll.user32.SendMessageW.argtypes = [
-    wintypes.HWND,
-    wintypes.UINT,
-    wintypes.WPARAM,
-    wintypes.LPARAM
+# --- IMM direct context API ---
+ctypes.windll.imm32.ImmGetContext.argtypes = [wintypes.HWND]
+ctypes.windll.imm32.ImmGetContext.restype = wintypes.HANDLE
+
+ctypes.windll.imm32.ImmReleaseContext.argtypes = [wintypes.HWND, wintypes.HANDLE]
+ctypes.windll.imm32.ImmReleaseContext.restype = wintypes.BOOL
+
+ctypes.windll.imm32.ImmGetOpenStatus.argtypes = [wintypes.HANDLE]
+ctypes.windll.imm32.ImmGetOpenStatus.restype = wintypes.BOOL
+
+ctypes.windll.imm32.ImmGetConversionStatus.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD)
 ]
-ctypes.windll.user32.SendMessageW.restype = wintypes.LPARAM
+ctypes.windll.imm32.ImmGetConversionStatus.restype = wintypes.BOOL
 
 
 def get_ime_input_status():
@@ -228,6 +234,42 @@ def get_ime_input_status():
         if not hwnd:
             return "unknown"
 
+        # 1) まず直接IMEコンテキストから取得する
+        himc = ctypes.windll.imm32.ImmGetContext(hwnd)
+        if himc:
+            try:
+                open_status = ctypes.windll.imm32.ImmGetOpenStatus(himc)
+
+                if not open_status:
+                    return "off"
+
+                conv_mode = wintypes.DWORD(0)
+                sentence_mode = wintypes.DWORD(0)
+
+                ok = ctypes.windll.imm32.ImmGetConversionStatus(
+                    himc,
+                    ctypes.byref(conv_mode),
+                    ctypes.byref(sentence_mode)
+                )
+
+                if ok:
+                    mode = conv_mode.value
+
+                    is_native = bool(mode & IME_CMODE_NATIVE)
+                    is_fullshape = bool(mode & IME_CMODE_FULLSHAPE)
+
+                    if is_native:
+                        return "japanese"
+
+                    if is_fullshape:
+                        return "full_romaji"
+
+                    return "half_romaji"
+
+            finally:
+                ctypes.windll.imm32.ImmReleaseContext(hwnd, himc)
+
+        # 2) 直接取得できない場合は、従来の既定IMEウィンドウ方式にフォールバック
         ime_hwnd = ctypes.windll.imm32.ImmGetDefaultIMEWnd(hwnd)
         if not ime_hwnd:
             return "unknown"
@@ -277,6 +319,9 @@ class LayerOverlay:
         self.is_running = True
         self.listener = None
 
+        self._last_mouse_pos = None
+        self.mouse_move_threshold = 12
+
         # 写真レイヤー用オーバーレイ
         self.overlay = tk.Toplevel(self.root)
         self.overlay.overrideredirect(True)
@@ -303,7 +348,7 @@ class LayerOverlay:
         self.is_mouse_follow_enabled = True
 
         # 追従間隔。30msはTkのgeometry連打になりやすいので少し緩める
-        self.mouse_follow_interval_ms = 80
+        self.mouse_follow_interval_ms = 120
         self.ime_watch_interval_ms = 250
 
         self.active_mode_key = "f13"
@@ -320,7 +365,7 @@ class LayerOverlay:
         self.status_overlay = tk.Toplevel(self.root)
         self.status_overlay.overrideredirect(True)
         self.status_overlay.attributes("-topmost", True)
-        self.status_overlay.attributes("-alpha", 0.92)
+        # self.status_overlay.attributes("-alpha", 0.92)
         self.status_overlay.config(bg="#F6D7E0")
 
         # 外枠フレーム
@@ -506,9 +551,18 @@ class LayerOverlay:
         w, h = self._status_size
 
         if self.is_mouse_follow_enabled:
-            # マウス追従表示
             mouse_x = self.root.winfo_pointerx()
             mouse_y = self.root.winfo_pointery()
+
+            if not force and self._last_mouse_pos is not None:
+                last_x, last_y = self._last_mouse_pos
+                if (
+                        abs(mouse_x - last_x) < self.mouse_move_threshold
+                        and abs(mouse_y - last_y) < self.mouse_move_threshold
+                ):
+                    return
+
+            self._last_mouse_pos = (mouse_x, mouse_y)
 
             offset_x = 18
             offset_y = 24
@@ -531,6 +585,7 @@ class LayerOverlay:
                 x = target_monitor.x
             if y < target_monitor.y:
                 y = target_monitor.y
+
         else:
             # 右下固定表示
             monitor = self.get_active_monitor()
@@ -539,7 +594,6 @@ class LayerOverlay:
 
         geometry = f"{w}x{h}+{int(x)}+{int(y)}"
 
-        # 同じ位置ならgeometryを打たない。Tk/Windowsへの負荷を減らす。
         if force or geometry != self._last_status_geometry:
             self.status_overlay.geometry(geometry)
             self._last_status_geometry = geometry
@@ -616,22 +670,29 @@ class LayerOverlay:
         self.recalc_status_size()
         self.place_status_overlay(force=True)
 
+        # Everything等で表示が古いまま残る対策
+        self.status_overlay.lift()
+        self.status_overlay.update_idletasks()
+
     def watch_ime_status(self):
         """
         IME状態を監視する。
-        unknown は表示更新に使わない。
+        Everythingなどでunknownになっても表示処理を止めない。
         """
         try:
             ime_status = get_ime_input_status()
 
+            # 確認用。安定したらコメントアウトしてOK
+            # print("IME:", ime_status, "LAST:", self.last_valid_ime_status)
+
             if ime_status == "unknown":
-                pass
+                ime_status = self.last_valid_ime_status
             else:
                 self.last_valid_ime_status = ime_status
 
-                if ime_status != self.last_ime_status:
-                    self.last_ime_status = ime_status
-                    self.update_mode_status(self.active_mode_key, ime_status)
+            if ime_status != self.last_ime_status:
+                self.last_ime_status = ime_status
+                self.update_mode_status(self.active_mode_key, ime_status)
 
         except Exception as e:
             print(f"IME Watch Error: {e}")
@@ -663,7 +724,7 @@ def on_press(key):
 
         if hasattr(key, 'name'):
             k = key.name
-        elif hasattr(key, 'char') and key.char():
+        elif hasattr(key, 'char') and key.char:
             k = key.char
         else:
             k = str(key).strip("'")
